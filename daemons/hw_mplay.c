@@ -81,6 +81,15 @@
 /* Mplay serial baud rate */
 #define MPLAY_BAUD_RATE 38400
 
+/* Mplay2 serial baud rate */
+#define MPLAY2_BAUD_RATE 57600
+
+/* Mplay2 initialisation character sent to device */
+#define MPLAY2_INIT_CHAR 0x96
+
+/* Mplay2 initialisation length of response to intialisation character */
+#define MPLAY2_INIT_RESPONSE_LENGTH 11
+
 /* Max time in micro seconde between the reception of repetition code. After
    this time, we ignore the key repeat */
 #define MAX_TIME_BETWEEN_TWO_REPETITION_CODE 500000
@@ -182,104 +191,92 @@ int mplay_init(void)
 	return result;
 }
 
+/**************************************************************************
+ * Sends initialisation character to  Moncaso 312/320 IR device
+ * (helper function for mplay2_init).
+ * Return 1 on success, 0 on error.
+ **************************************************************************/
+static int mplay2_send_init_char(void)
+{
+	const char init = MPLAY2_INIT_CHAR;
+
+	if (write(hw.fd, &init, 1) < 0) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+/**************************************************************************
+ * Retrieves initialisation response from Moncaso 312/320 IR device
+ * (helper function for mplay2_init).
+ * Moncaso 320 returns ".M428.M428.".
+ * Return 1 on success, 0 on error.
+ **************************************************************************/
+static int mplay2_retrieve_init_response(void)
+{
+	int i;
+	char response[MPLAY2_INIT_RESPONSE_LENGTH + 1]; /* contains string terminating zero */
+
+	/* Reset response buffer */
+	memset(response, 0, sizeof(response));
+
+	/* Read-function blocks until characters arrive from serial device */
+	fcntl(hw.fd, F_SETFL, 0);
+	/* Get response to initialisation character */
+	for (i = 0; i < MPLAY2_INIT_RESPONSE_LENGTH; i++) {
+		/* Get next character (blocks until arrival in order to avoid polling) */
+		if (read(hw.fd, &response[i], 1) < 0) {
+			return 0;
+		}
+	}
+	/* Restore non-blocking behaviour */
+	fcntl(hw.fd, F_SETFL, FNDELAY);
+	LOGPRINTF(1, "Device initialisation response: %s", response);
+
+	return 1;
+}
+
+/**************************************************************************
+ * Locks and initialises the serial port, Moncaso 312/320 variant.
+ * This function is called by the LIRC daemon when the first client
+ * registers itself.
+ * Return 1 on success, 0 on error.
+ **************************************************************************/
 int mplay2_init(void)
 {
-	struct termios portset;
-	signed int len;
-	char buf = 0x96;
-	char psResponse[11];
+	int result = 1;
 
 	LOGPRINTF(1, "Entering mplay_init()");
+
 	/* Creation of a lock file for the port */
 	if (!tty_create_lock(hw.device)) {
 		logprintf(LOG_ERR, "Could not create the lock file");
-		LOGPRINTF(1, "Could not create the lock file");
-		return 0;
+		result = 0;
 	}
-
-	LOGPRINTF(0, "open serial port");
-	/* Try to open serial port (Monueal Moncaso 312 device doesn't like O_NONBLOCK */
-	if ((hw.fd = open(hw.device, O_RDWR | O_NOCTTY)) < 0) {
+	/* Try to open serial port */
+	else if ((hw.fd = open(hw.device, O_RDWR | O_NONBLOCK | O_NOCTTY)) < 0) {
 		logprintf(LOG_ERR, "Could not open the serial port");
-		LOGPRINTF(1, "Could not open the serial port");
-		tty_delete_lock();
-		return 0;
+		result =  0;
+	}
+	/* Serial port configuration */
+	else if (!tty_reset(hw.fd) || !tty_setbaud(hw.fd, MPLAY2_BAUD_RATE)) {
+		logprintf(LOG_ERR, "Could not configure the serial port for '%s'", hw.device);
+		result = 0;
+	}
+	/* Send initialisation character to device and retrieve response */
+	else if (!mplay2_send_init_char() || !mplay2_retrieve_init_response()) {
+		logprintf(LOG_ERR, "Could not initialise device");
+		result = 0;
 	}
 
-	/* Get serial device parameters */
-	if (tcgetattr(hw.fd, &portset) < 0) {
-		logprintf(LOG_ERR, "Could not get serial port attributes");
-		LOGPRINTF(1, "Could not get serial port attributes");
+	/* Clean up if an error has occured */
+	if (result == 0) {
+		logperror(LOG_ERR, "mplay2_init()");
 		mplay_deinit();
-		return 0;
 	}
 
-	/* use own termios struct instead of using tty_reset , Moncaso doesn't like TCSAFLUSH */
-	portset.c_cflag &= ~PARENB;
-	portset.c_cflag &= ~CSTOPB;
-	portset.c_cflag &= ~CSIZE;
-	portset.c_cflag = B57600 | CS8;
-	portset.c_cflag |= (CLOCAL | CREAD);
-	portset.c_iflag |= (IXON | IXOFF | IXANY);
-	portset.c_oflag &= ~OPOST;
-	portset.c_lflag &= ~(ICANON | ECHOE | ECHO | ISIG);
-	portset.c_cc[VSTART] = 0x11;
-	portset.c_cc[VSTOP] = 0x13;
-	portset.c_cc[VEOF] = 0x20;
-	portset.c_cc[VMIN] = 1;
-	portset.c_cc[VTIME] = 3;
-
-	if (tcsetattr(hw.fd, TCSANOW, &portset) < 0) {
-		logprintf(LOG_ERR, "Error setting TCSANOW mode of serial device");
-		LOGPRINTF(1, "Error setting TCSANOW mode of serial device");
-		mplay_deinit();
-		return 0;
-	}
-
-	len = write(hw.fd, &buf, 1);
-	if (len < 0) {
-		LOGPRINTF(LOG_ERR, "couldn't write to device");
-		mplay_deinit();
-		return 0;
-	}
-
-	len = read(hw.fd, &psResponse, 11);
-	if (len < 0) {
-		LOGPRINTF(1, "No data recieved during reading");
-		mplay_deinit();
-		return 0;
-	} else
-		LOGPRINTF(1, "read chars: %s", psResponse);
-
-	if (tcgetattr(hw.fd, &portset) < 0) {
-		logprintf(LOG_ERR, "Could not get serial port attributes");
-		LOGPRINTF(1, "Could not get serial port attributes");
-		mplay_deinit();
-		return 0;
-	}
-
-	portset.c_cflag &= ~PARENB;
-	portset.c_cflag &= ~CSTOPB;
-	portset.c_cflag &= ~CSIZE;
-	portset.c_cflag = B57600 | CS8;
-	portset.c_cflag |= (CLOCAL | CREAD);
-	portset.c_iflag |= (IXON | IXOFF | IXANY);
-	portset.c_oflag &= ~OPOST;
-	portset.c_lflag &= ~(ICANON | ECHOE | ECHO | ISIG);
-	portset.c_cc[VSTART] = 0x11;
-	portset.c_cc[VSTOP] = 0x13;
-	portset.c_cc[VEOF] = 0x1C;
-	portset.c_cc[VMIN] = 1;
-	portset.c_cc[VTIME] = 3;
-
-	if (tcsetattr(hw.fd, TCSANOW, &portset) < 0) {
-		logprintf(LOG_ERR, "Error setting TCSANOW mode of serial device");
-		LOGPRINTF(1, "Error setting TCSANOW mode of serial device");
-		mplay_deinit();
-		return 0;
-	}
-
-	return 1;
+	return result;
 }
 
 /**************************************************************************
